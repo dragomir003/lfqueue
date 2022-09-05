@@ -14,15 +14,15 @@ struct Channel {
     struct Node
     {
         std::shared_ptr<T> data;
-        std::atomic<std::shared_ptr<Node>> next;
+        std::atomic<Node*> next;
         template<typename ...Args>
         Node(Args&& ...args):
-            data(std::make_unique<T>(args...)), next(nullptr) {}
+            data(new T{args...}), next(nullptr) {}
         Node()
             : data(nullptr), next(nullptr) {}
     };
-    std::atomic<std::shared_ptr<Node>> tail;
-    std::atomic<std::shared_ptr<Node>> head;
+    std::atomic<Node*> tail;
+    std::atomic<Node*> head;
 
 //public:
 
@@ -30,7 +30,7 @@ struct Channel {
     using pointer_type = std::shared_ptr<T>;
 
     Channel() {
-        head = std::shared_ptr<Node>(new Node());
+        head = new Node();
         tail = head.load();
     }
 
@@ -38,30 +38,30 @@ struct Channel {
     template <typename ...Args>
     void push(Args ...args)
     {
-        std::shared_ptr<Node> null_node = nullptr;
-        std::shared_ptr<Node> q = std::make_unique<Node>(args...);
+        Node* null_node = nullptr;
+        Node* q = new Node{args...};
 
-        std::shared_ptr<Node> p;
-        bool succ;
+        Node* p;
+        for (p = tail.load();
+            !p->next.compare_exchange_strong(null_node, q);
+            p = tail.load());
 
-        do {
-            p = tail.load();
-            if (!(succ = p->next.compare_exchange_weak(null_node, q)))
-                tail.compare_exchange_weak(p, p->next);
-        } while (!succ);
-        tail.compare_exchange_weak(p, q);
+        tail.compare_exchange_strong(p, q);
     }
 
     std::shared_ptr<T> pop()
     {
-        std::shared_ptr<Node> p;
+        Node* p;
         do {
             p = head.load();
-            if (p == nullptr)
+            if (p->next == nullptr)
                 return nullptr;
         } while (!head.compare_exchange_weak(p, p->next));
 
-        return p->data;
+        Node* q = p->next;
+        delete p;
+
+        return q->data;
     }
 
 };
@@ -86,23 +86,9 @@ auto main(int argc, char* argv[]) -> int {
     const int num_writers = argc > 1 ? std::atoi(argv[1]) : 3;
     for (int i = 0; i < num_writers; ++i) {
         writers.emplace_back(func, i);
+        writers.back().detach();
         dones.emplace_back(false);
     }
-
-    for (auto& writer : writers)
-        writer.join();
-
-    std::shared_ptr<int> tmp = (channel.pop(), channel.pop());
-    int total = 0;
-    while (tmp) {
-        std::cout << *tmp << '\n';
-        ++total;
-        tmp = channel.pop();
-    }
-    std::cout << total << '\n';
-
-    return 0;
-/*
     const auto is_filled = [&dones] {
         return std::count(begin(dones), end(dones), true) == dones.size();
     };
@@ -118,8 +104,7 @@ auto main(int argc, char* argv[]) -> int {
 
         ++total;
 
-        std::cout << "Got(" << total << ") " << *value << '@' << value << '\r' << std::flush;
+        std::cout << "Got " << total << " " << *value << '@' << value << '\n' << std::flush;
     }
     std::cout << '\n';
-    */
 }
