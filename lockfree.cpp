@@ -59,10 +59,10 @@ struct Channel {
             p = head.load();
             if (p->next == nullptr)
                 return nullptr;
-        } while (!head.compare_exchange_weak(p, p->next));
+        } while (!head.compare_exchange_strong(p, p->next));
 
         Node* q = p->next;
-        delete p;
+        //delete p;
 
         return q->data;
     }
@@ -71,42 +71,47 @@ struct Channel {
 
 auto main(int argc, char* argv[]) -> int {
 
-    std::array<int, 16> array{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    static std::array<int, 16> array{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    static Channel<int> channel;
 
-    using IndexType = std::uint16_t;
-    Channel<int> channel;
+    const int num_writers = argc > 1 ? std::atoi(argv[1]) : 3;
+    const int num_readers = argc > 2 ? std::atoi(argv[2]) : 1;
+    const size_t total_messages = 80 * num_writers * (num_writers + 1);
 
-    std::vector<bool> dones;
-    std::vector<std::thread> writers;
-
-    const auto func = [&channel, &array, &dones](int idx) {
+    const auto func = [](int idx) {
         for (int i = 0; i < (idx + 1) * 10; ++i)
             for (const auto elem : array)
                 channel.push(elem);
-        dones[idx] = true;
     };
 
-    const int num_writers = argc > 1 ? std::atoi(argv[1]) : 3;
-    const size_t total_messages = 80 * num_writers * (num_writers + 1);
+    std::atomic<std::uintmax_t> total = 0;
+    const auto readfunc = [&total, total_messages] {
+        while (total < total_messages) {
+            if (auto value = channel.pop(); value != nullptr)
+                ++total;
+        }
+    };
+
+    std::vector<std::thread> writers;
     for (int i = 0; i < num_writers; ++i) {
         writers.emplace_back(func, i);
         writers.back().detach();
-        dones.emplace_back(false);
     }
-    const auto is_filled = [&dones] {
-        return std::count(begin(dones), end(dones), true) == dones.size();
-    };
+    std::cout << "Init writers\n";
 
-    std::uintmax_t total = 0;
-    while (total < total_messages) {
-        auto value = channel.pop();
+    std::vector<std::thread> readers;
+    for (int i = 0; i < num_readers; ++i) {
+        readers.emplace_back(readfunc);
+        readers.back().detach();
+    }
+    std::cout << "Init readers\n";
 
-        if (!value && is_filled())
-            break;
-        if (!value)
+    std::uintmax_t old_total = total;
+    while (old_total < total_messages) {
+        if (total == old_total)
             continue;
-
-        ++total;
+        std::cout << old_total << '\n' << std::flush;
+        old_total = total;
     }
-    std::cout << total << '\n';
+    std::cout << old_total << "\nDone\n";
 }
