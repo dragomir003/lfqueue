@@ -39,8 +39,6 @@ auto main(int argc, char* argv[]) -> int {
             continue;
 
         ++total;
-
-        std::cout << "Got(" << total << ") " << *value << '@' << &value << '\r' << std::flush;
     }
-    std::cout << '\n';
+    std::cout << total << '\n';
 }
