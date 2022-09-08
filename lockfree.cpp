@@ -1,8 +1,11 @@
 #include <atomic>
 #include <memory>
 
+#include <cassert>
 #include <thread>
 #include <algorithm>
+#include <future>
+#include <iomanip>
 #include <vector>
 #include <array>
 #include <iostream>
@@ -13,21 +16,23 @@ struct Channel {
 
     struct Node
     {
-        std::shared_ptr<T> data;
+        T* data;
+
+        std::atomic<std::int64_t> refct;
         std::atomic<Node*> next;
+
         template<typename ...Args>
-        Node(Args&& ...args):
-            data(new T{args...}), next(nullptr) {}
+        Node(Args&& ...args)
+            : data(new T{args...}), next(nullptr), refct(1) {}
+
         Node()
-            : data(nullptr), next(nullptr) {}
+            : data(nullptr), next(nullptr), refct(1) {}
     };
+
     std::atomic<Node*> tail;
     std::atomic<Node*> head;
 
 //public:
-
-    using value_type = T;
-    using pointer_type = std::shared_ptr<T>;
 
     Channel() {
         head = new Node();
@@ -38,13 +43,14 @@ struct Channel {
     template <typename ...Args>
     void push(Args&& ...args)
     {
-        Node* null_node = nullptr;
+        Node* null_node;
         Node* q = new Node{args...};
 
         Node* p = tail.load();
         Node* oldp = p;
 
         do {
+            Node* null_node = nullptr;
             while (p->next != nullptr)
                 p = p->next;
         } while (!p->next.compare_exchange_weak(null_node, q));
@@ -52,66 +58,109 @@ struct Channel {
         tail.compare_exchange_strong(oldp, q);
     }
 
-    std::shared_ptr<T> pop()
+    void release(Node* n) {
+        auto prev = n->refct.fetch_sub(1);
+        if (prev == 1) {
+            delete n->data;
+            delete n;
+        }
+    }
+
+    void acquire(Node* n) {
+        auto prev = n->refct.fetch_add(1);
+    }
+
+    Node* pop()
     {
-        Node* p;
+        Node* p = nullptr;
+        Node* next = nullptr;
+    
         do {
-            p = head.load();
+            p = head;
+
             if (p->next == nullptr)
                 return nullptr;
-        } while (!head.compare_exchange_strong(p, p->next));
 
-        Node* q = p->next;
-        //delete p;
+            if (next != nullptr)
+                release(next);
 
-        return q->data;
+            next = p->next;
+            acquire(next);
+        } while (!head.compare_exchange_weak(p, next));
+
+        release(p);
+
+        return next;
     }
 
 };
 
 auto main(int argc, char* argv[]) -> int {
-
-    static std::array<int, 16> array{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
     static Channel<int> channel;
 
     const int num_writers = argc > 1 ? std::atoi(argv[1]) : 3;
     const int num_readers = argc > 2 ? std::atoi(argv[2]) : 1;
-    const size_t total_messages = 80 * num_writers * (num_writers + 1);
+    const size_t num_tasks = num_writers + num_readers;
 
-    const auto func = [](int idx) {
+    using ResultArray = std::array<int, 16>;
+
+    const auto writefunc = [](int idx) -> ResultArray {
+        ResultArray res{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         for (int i = 0; i < (idx + 1) * 10; ++i)
-            for (const auto elem : array)
-                channel.push(elem);
+            for (int j = 0; j < res.size(); ++j) {
+                channel.push(j);
+                res[j] += 1;
+            }
+        return res;
     };
 
-    std::atomic<std::uintmax_t> total = 0;
-    const auto readfunc = [&total, total_messages] {
-        while (total < total_messages) {
-            if (auto value = channel.pop(); value != nullptr)
-                ++total;
+    const auto readfunc = [](int idx) -> ResultArray {
+        ResultArray res{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        auto value = channel.pop();
+        for (; value; value = channel.pop()) {
+            int x = *(value->data);
+            res[x] += 1;
+            channel.release(value);
         }
+        return res;
     };
 
-    std::vector<std::thread> writers;
+    std::vector<std::future<ResultArray>> tasks;
+    for (int i = 0; i < num_tasks; ++i) {
+        if (i == num_writers)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        tasks.push_back(std::async(std::launch::async, i < num_writers ? writefunc : readfunc, i));
+    }
+
+    int done_tasks = 0;
+    while (done_tasks < num_tasks) {
+        std::cout << "Waiting for tasks..." << done_tasks << '/' << num_tasks << '\r';
+        using namespace std::literals;
+        for (auto& task : tasks)
+            if (task.wait_for(100ms) == std::future_status::ready)
+                ++done_tasks;
+        std::cout << std::flush;
+    }
+
+    unsigned total_written = 0;
     for (int i = 0; i < num_writers; ++i) {
-        writers.emplace_back(func, i);
-        writers.back().detach();
+        auto tmp = tasks[i].get();
+        for (int j = 0; j < tmp.size(); ++j)
+            total_written += tmp[j];
     }
-    std::cout << "Init writers\n";
+    unsigned total_read = 0;
+    for (int i = num_writers; i < num_tasks; ++i) {
+        auto tmp = tasks[i].get();
+        for (int j = 0; j < tmp.size(); ++j)
+            total_read += tmp[j];
+    }
 
-    std::vector<std::thread> readers;
-    for (int i = 0; i < num_readers; ++i) {
-        readers.emplace_back(readfunc);
-        readers.back().detach();
-    }
-    std::cout << "Init readers\n";
+    std::cout << "\nRead " << total_read << '/' << total_written << '\n';
 
-    std::uintmax_t old_total = total;
-    while (old_total < total_messages) {
-        if (total == old_total)
-            continue;
-        std::cout << old_total << '\n' << std::flush;
-        old_total = total;
+    for (auto value = channel.pop(); value; value = channel.pop()) {
+        ++total_read;
+        channel.release(value);
     }
-    std::cout << old_total << "\nDone\n";
+    std::cout << "Read " << total_read << '/' << total_written << '\n';
+    
 }
